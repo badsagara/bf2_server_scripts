@@ -59,8 +59,8 @@ try:
 except Exception:
     _time = None
 
-__version__ = 1.41
-VERSION = '1.4.1'
+__version__ = 1.42
+VERSION = '1.4.2'
 
 __required_modules__ = {
     'modmanager': 1.0
@@ -218,6 +218,9 @@ configDefaults = {
     'ARENA_CRATE_WAY': 'spawner',   # spawner: a crate is made by our own ObjectSpawner (the game makes it - the way
                                     # the claytest crate was seen) | direct: Object.create supply_crate (1.3.7-1.3.9:
                                     # the server had them, the players did not see them)
+    'ARENA_SPAWNER_DELAY': 0,       # spawner way: seconds before a spawner makes its next crate when its crate is
+                                    # gone (used up, broken, timed out) - 0 as in the claytest, where crates came
+                                    # 2 s after the spawner was placed (1.4.0's 99999 made none at all)
     'ARENA_CRATE_DROP': 40,         # metres over its point a crate is made: it comes down on its own parachute
                                     # (supply_crate carries supply_parachute), like the commander's; 0 = on the ground
     'INF_MAGS': 0,                  # off since 1.2.0: the server takes the number, the game does not (15.11 test)
@@ -450,7 +453,7 @@ MATERIAL_NAMES = {23: 'Human_bodyarmour', 24: 'Human_body', 25: 'Human_head', 77
                   69: 'Detonation_grenade', 70: 'Explosion_blastwave', 80: 'Detonation_C4'}
 SOLDIER_MATS = (23, 24, 25, 77, 1010)
 USAGE = ('fldm: on | off | status | info [say] | hp [0-100|full|off] | crates [0-30|off|now] | stamina [on|off] | '
-         'hs [on|off] | nades [on|off] | knife [on|off] | rockets [on|off] | '
+         'end | hs [on|off] | nades [on|off] | knife [on|off] | rockets [on|off] | '
          'defib [on|off] | snipers [on|off] | stationary [on|off] | vehmg [on|off] | weapons | '
          'band [min max [never under]]')
 # GRENADES / KNIVES / ROCKETS 0: the attack materials whose cells against SOLDIER_MATS go to 0. From the weapon
@@ -2834,7 +2837,7 @@ class FLDeathmatch(object):
             extra.append('endless stamina')
         if self.ac_count() > 0:
             extra.append('%d ammo crates%s move round the arena every %d s'
-                         % (self.ac_count(), (self.ci('ARENA_CRATE_HEAL') <= 0 and ' (no healing)') or '',
+                         % (self.ac_count(), (self.ci('ARENA_CRATE_HEAL') == 0 and ' (no healing)') or '',
                             max(10, self.ci('ARENA_CRATE_EVERY'))))
         if self.ci('PUBLIC_SCORE'):
             extra.append('type !dm for the score')
@@ -4725,6 +4728,13 @@ class FLDeathmatch(object):
             self.rcon('Object.active %s' % c['sp_oid'])
             self.rcon('Object.delete')
             c['sp_oid'] = ''
+        if c.get('sp_obj') is not None:
+            try:
+                q = c['sp_obj'].getPosition()
+                c['sp_obj'].setPosition((float(q[0]), -1000.0, float(q[2])))
+            except Exception:
+                pass
+            c['sp_obj'] = None
         if c.get('find'):
             del c['find']
         if c['obj'] is None and c.get('spawner'):
@@ -5039,9 +5049,9 @@ class FLDeathmatch(object):
             st = self.ac_stat
             self.ac_sets = self.ac_sets + 1
             if self.ac_sets <= 3 or st['lost'] or st['unseen']:
-                self.log('arena crates set %d: %d out (moved %d, made %d, reused %d, lost %d, not listed %d) at %s'
+                self.log('arena crates set %d: %d out (moved %d, made %d, reused %d, lost %d, not listed %d, kept %d) at %s'
                          % (self.ac_sets, len(self.ac_live()), st['moved'], st['made'], st['reused'], st['lost'],
-                            st['unseen'], ', '.join(st['at'])))
+                            st['unseen'], st.get('kept', 0), ', '.join(st['at'])))
 
     def ac_plan(self, n):
         live = self.ac_live()
@@ -5076,16 +5086,16 @@ class FLDeathmatch(object):
                  'ObjectTemplate.hasMobilePhysics 0',
                  'ObjectTemplate.setObjectTemplate 1 %s' % name,
                  'ObjectTemplate.setObjectTemplate 2 %s' % name,
-                 'ObjectTemplate.minSpawnDelay 99999',
-                 'ObjectTemplate.maxSpawnDelay 99999',
-                 'ObjectTemplate.spawnDelayAtStart 0',
+                 'ObjectTemplate.minSpawnDelay %d' % max(0, self.ci('ARENA_SPAWNER_DELAY')),
+                 'ObjectTemplate.maxSpawnDelay %d' % max(0, self.ci('ARENA_SPAWNER_DELAY')),
                  'ObjectTemplate.maxNrOfObjectSpawned 1']
         ans = []
         for ln in lines:
             a = self.rcon(ln)
             if a:
                 ans.append('%s -> "%s"' % (ln, a))
-        self.log('crate spawner template %s for %s: %s' % (sp, name, '; '.join(ans) or 'no answers'))
+        self.log('crate spawner template %s for %s (delay %d s): %s' % (sp, name, max(0, self.ci('ARENA_SPAWNER_DELAY')),
+                                                                      '; '.join(ans) or 'no answers'))
         self.crate_sp = sp
         return sp
 
@@ -5134,12 +5144,13 @@ class FLDeathmatch(object):
 
     def ac_find(self, t):
         """Spawner crates: the crate the game made under our spawner (within 3 m across, between its point and the
-        spawner) is ours - looked for every 0.5 s up to 8 s."""
-        want = []
+        spawner) is ours - looked for every 0.5 s; a crate of ours that is no longer listed (used up, broken, timed
+        out) is let go, and its spawner's next one is looked for."""
+        sp_slots = []
         for c in self.crates:
-            if c.get('find') and c['state'] == 'live' and c['obj'] is None:
-                want.append(c)
-        if not want or t < getattr(self, 'ac_find_next', 0.0):
+            if c.get('spawner') and c['state'] == 'live' and c.get('kind') in ('arena', 'test'):
+                sp_slots.append(c)
+        if not sp_slots or t < getattr(self, 'ac_find_next', 0.0):
             return
         self.ac_find_next = t + 0.5
         name = self.cs('CRATE')
@@ -5148,6 +5159,27 @@ class FLDeathmatch(object):
             objs = bf2.objectManager.getObjectsOfTemplate(name)
         except Exception:
             objs = []
+        for c in sp_slots:
+            if c['obj'] is None:
+                continue
+            there = 0
+            for o in objs:
+                if o is c['obj']:
+                    there = 1
+            if not there:
+                c['obj'] = None
+                c['find'] = (t, c.get('high', c['spot']))
+                self.ac_gone = getattr(self, 'ac_gone', 0) + 1
+                if self.ac_gone <= 3:
+                    self.log('a spawner crate is gone (used up, broken or timed out) - the next one is looked for')
+        want = []
+        for c in sp_slots:
+            if c['obj'] is None:
+                if not c.get('find'):
+                    c['find'] = (t, c.get('high', c['spot']))
+                want.append(c)
+        if not want:
+            return
         ours = []
         for c in self.crates:
             if c['obj'] is not None:
@@ -5176,16 +5208,18 @@ class FLDeathmatch(object):
                 c['obj'] = best[1]
                 ours.append(best[1])
                 del c['find']
+                if c.get('missed'):
+                    del c['missed']
                 if self.ac_found_logged < 3:
                     self.ac_found_logged = self.ac_found_logged + 1
                     self.log('crate from the spawner seen %.1f s after it was placed, at %s' % (t - t0, fmt_pos(best[2])))
-            elif t - t0 > 8.0:
-                del c['find']
+            elif t - t0 > 8.0 and not c.get('missed'):
+                c['missed'] = 1
                 self.ac_stat['unseen'] = self.ac_stat.get('unseen', 0) + 1
                 if self.ac_found_logged < 6:
                     self.ac_found_logged = self.ac_found_logged + 1
                     self.log('NO crate from the spawner at %s in 8 s (the game made none, or it is not where it '
-                             'should be)' % fmt_pos(high))
+                             'should be) - still looked for' % fmt_pos(high))
 
     def run_ac_checks(self, t):
         keep = []
@@ -5212,6 +5246,86 @@ class FLDeathmatch(object):
                      % (label, int(dt), fmt_pos(q), d, q[1] - spot[1]))
         self.ac_checks = keep
 
+    def ac_spawner_way(self):
+        return self.cs('ARENA_CRATE_WAY').strip().lower() != 'direct'
+
+    def spawner_obj_at(self, sp, high, taken):
+        """The object of our spawner template just placed at high (the game lists it like any object), or None."""
+        self.calls = self.calls + 1
+        try:
+            objs = bf2.objectManager.getObjectsOfTemplate(sp)
+        except Exception:
+            return None
+        best = None
+        for o in objs:
+            skip = 0
+            for x in taken:
+                if x is o:
+                    skip = 1
+            if skip:
+                continue
+            try:
+                q = o.getPosition()
+                d = dist3((float(q[0]), float(q[1]), float(q[2])), high)
+            except Exception:
+                continue
+            if d <= 1.5 and (best is None or d < best[0]):
+                best = (d, o)
+        if best is None:
+            return None
+        return best[1]
+
+    def ac_place_sp(self, slot, k, t, c, pt, spot, high, name):
+        """Spawner way: a slot keeps its spawner; each move puts the spawner (and its crate, if it is still there)
+        over the new point - when a crate is used up or goes, the spawner makes the next one there by itself."""
+        st = self.ac_stat
+        if c is not None and c.get('sp_obj') is not None:
+            try:
+                c['sp_obj'].setPosition(high)
+            except Exception:
+                c['sp_obj'] = None
+            if c.get('sp_obj') is not None:
+                if c['obj'] is not None:
+                    try:
+                        c['obj'].setPosition(high)
+                    except Exception:
+                        c['obj'] = None
+                c['spot'] = spot
+                c['high'] = high
+                c['k'] = k
+                if c['obj'] is None:
+                    c['find'] = (t, high)
+                st['moved'] = st['moved'] + 1
+                return
+        if c is not None and c.get('spawner'):
+            # its spawner object is not listed by the game, so it cannot be moved; a new spawner would leave the old
+            # one making crates where it stands - so the slot stays where it is
+            st['kept'] = st.get('kept', 0) + 1
+            if not getattr(self, 'ac_static_said', 0):
+                self.ac_static_said = 1
+                self.log('arena crates: the spawner objects are not listed by the game - the crates stay at their '
+                         'first points (the spawners make a new one there when one is used up)')
+            return
+        if c is not None:
+            self.remove_crate(c, 'a spawner crate instead', 1)
+        self.crates = [x for x in self.crates if x['state'] != 'gone']
+        (obj, oid, ans, soid) = self.crate_make(name, high, 'spawner')
+        taken = []
+        for x in self.crates:
+            if x.get('sp_obj') is not None:
+                taken.append(x['sp_obj'])
+        spo = self.spawner_obj_at(self.crate_sp, high, taken)
+        c = {'t': t, 'until': 1e18, 'oid': '', 'ai': None, 'spot': spot, 'high': high, 'name': name, 'obj': None,
+             'state': 'live', 'kind': 'arena', 'slot': slot, 'k': k, 'sp_oid': soid, 'sp_obj': spo, 'spawner': 1,
+             'find': (t, high)}
+        self.crates.append(c)
+        st['made'] = st['made'] + 1
+        if self.ac_logged < 2:
+            self.ac_logged = self.ac_logged + 1
+            self.log('arena crate %d at %s (%s, made %.0f m over it): %s; its spawner object: %s'
+                     % (slot + 1, pt[0], fmt_pos(spot), self.ac_drop(), ans, (spo is not None and 'found') or 'NOT listed'))
+            self.ac_check_later(c, spot, 'arena crate %d (%s)' % (slot + 1, pt[0]), t)
+
     def ac_place(self, slot, k, t):
         pt = self.points[k]
         spot = (pt[1], pt[2] + 0.3, pt[3])
@@ -5223,6 +5337,9 @@ class FLDeathmatch(object):
         for x in self.ac_live():
             if x.get('slot') == slot:
                 c = x
+        if self.ac_spawner_way():
+            self.ac_place_sp(slot, k, t, c, pt, spot, high, name)
+            return
         if c is not None and self.ac_new():
             self.remove_crate(c, 'a new one instead', 1)
             st['old'] = st.get('old', 0) + 1
@@ -5358,11 +5475,12 @@ class FLDeathmatch(object):
         if way not in ('direct', 'spawner'):
             way = self.cs('ARENA_CRATE_WAY').strip().lower()
         (obj, oid, ans, soid) = self.crate_make(name, high, way)
-        c = {'t': t, 'until': t + 120.0, 'oid': oid, 'ai': None, 'spot': spot, 'name': name, 'obj': obj,
+        c = {'t': t, 'until': t + 120.0, 'oid': oid, 'ai': None, 'spot': spot, 'high': high, 'name': name, 'obj': obj,
              'state': 'live', 'kind': 'test', 'sp_oid': soid}
         if soid or (obj is None and way != 'direct'):
             c['find'] = (t, high)
             c['spawner'] = 1
+            c['sp_obj'] = self.spawner_obj_at(self.crate_sp, high, [])
         self.crates.append(c)
         self.log('crate here (%s way) for %s at %s (made %.0f m over it, facing %.0f): create %s; the server lists it '
                  'there: %s' % (way, self.name_of(p), fmt_pos(spot), up, yaw, ans, (obj is not None and 'yes') or 'NO'))
@@ -5380,6 +5498,8 @@ class FLDeathmatch(object):
         heal = 'no healing'
         if self.ci('ARENA_CRATE_HEAL') > 0:
             heal = 'healSpeed %d' % self.ci('ARENA_CRATE_HEAL')
+        elif self.ci('ARENA_CRATE_HEAL') < 0:
+            heal = 'the crate template untouched'
         how = 'new ones'
         if not self.ac_new():
             how = 'moved'
@@ -5471,6 +5591,16 @@ class FLDeathmatch(object):
             return self.ac_cmd(words[1:], who)
         if sub in ('stamina', 'sprint'):
             return self.stamina_cmd(words[1:], who)
+        if sub in ('end', 'endround'):
+            if not self.active:
+                return ('fldm: deathmatch is not on this round - to end a normal round use the game\'s own '
+                        '"admin.runNextLevel" (or BF2CC\'s next map)')
+            tm = 1
+            if self.team_frags[2] > self.team_frags[1]:
+                tm = 2
+            self.log('round ended by %s (%d : %d)' % (who, self.team_frags[1], self.team_frags[2]))
+            self.start_end(tm, '[DM] Round ended by an admin')
+            return 'fldm: the round ends now (MEC %d : US %d)' % (self.team_frags[1], self.team_frags[2])
         if sub == 'info':
             lines = self.info_lines()
             if len(words) > 1 and words[1].lower() == 'say':
@@ -5543,7 +5673,9 @@ class FLDeathmatch(object):
         out = [a, b + ' A frag gives %s.' % self.hp_text()]
         if self.ac_count() > 0:
             out.append('[DM] Ammo crates: %d in the arena (ammo only%s), they move every %d s - !dm crates where.'
-                       % (self.ac_count(), (self.ci('ARENA_CRATE_HEAL') > 0 and ', some healing') or ', no healing',
+                       % (self.ac_count(), ((self.ci('ARENA_CRATE_HEAL') > 0 and ', some healing') or
+                                            (self.ci('ARENA_CRATE_HEAL') < 0 and ', healing as the commander\'s') or
+                                            ', no healing'),
                           max(10, self.ci('ARENA_CRATE_EVERY'))))
         return out
 
