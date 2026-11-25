@@ -59,8 +59,8 @@ try:
 except Exception:
     _time = None
 
-__version__ = 1.40
-VERSION = '1.4.0'
+__version__ = 1.41
+VERSION = '1.4.1'
 
 __required_modules__ = {
     'modmanager': 1.0
@@ -204,11 +204,17 @@ configDefaults = {
     'ARENA_CRATES': 10,             # supply crates (CRATE) spread over the arena's points while deathmatch is on;
                                     # 0 = none (most 30)
     'ARENA_CRATE_EVERY': 60,        # seconds: then they all move to new points (spread out, not the last ones)
-    'ARENA_CRATE_HEAL': 0,          # the crate template's healSpeed while they are out (0 = ammo only)
+    'ARENA_CRATE_HEAL': 0,          # the crate template's healSpeed while they are out (0 = ammo only; -1 = the
+                                    # template is not touched at all: heal and ammo as in the game)
     'ARENA_CRATE_AMMO': '',         # its refillAmmoSpeed then ('' = the game's own; 1000 = at once)
     'ARENA_CRATE_MODE': 'new',      # new: every move makes new crates and puts the old ones away (a crate made
                                     # while you play is surely sent to your game) | move: the same crates moved
     'ARENA_CRATE_START': 20,        # seconds after deathmatch starts before the first crates (people loading in)
+    'STAMINA': 1,                   # 1 = endless sprint while deathmatch is on (soldier templates: SprintRecoverTime
+                                    # 0.1, SprintDissipationTime 100000, SprintLossAtJump 0; put back after)
+    'STAMINA_SOLDIERS': 'us_light_soldier, us_heavy_soldier, mec_light_soldier, mec_heavy_soldier, '
+                        'ch_light_soldier, ch_heavy_soldier',
+                                    # soldier templates (and any seen at a spawn); a name the server lacks: left alone
     'ARENA_CRATE_WAY': 'spawner',   # spawner: a crate is made by our own ObjectSpawner (the game makes it - the way
                                     # the claytest crate was seen) | direct: Object.create supply_crate (1.3.7-1.3.9:
                                     # the server had them, the players did not see them)
@@ -443,7 +449,8 @@ MATERIAL_NAMES = {23: 'Human_bodyarmour', 24: 'Human_body', 25: 'Human_head', 77
                   41: 'Bullet_shotgun', 45: 'Grenade_rifle', 46: 'Grenade_hand', 48: 'Knife', 52: 'Missile_antitank',
                   69: 'Detonation_grenade', 70: 'Explosion_blastwave', 80: 'Detonation_C4'}
 SOLDIER_MATS = (23, 24, 25, 77, 1010)
-USAGE = ('fldm: on | off | status | info [say] | hp [0-100|full|off] | crates [0-30|off|now] | hs [on|off] | nades [on|off] | knife [on|off] | rockets [on|off] | '
+USAGE = ('fldm: on | off | status | info [say] | hp [0-100|full|off] | crates [0-30|off|now] | stamina [on|off] | '
+         'hs [on|off] | nades [on|off] | knife [on|off] | rockets [on|off] | '
          'defib [on|off] | snipers [on|off] | stationary [on|off] | vehmg [on|off] | weapons | '
          'band [min max [never under]]')
 # GRENADES / KNIVES / ROCKETS 0: the attack materials whose cells against SOLDIER_MATS go to 0. From the weapon
@@ -475,6 +482,7 @@ TZ_GROUPS = [
     ('nades', 'GRENADES', 'GRENADE_NAMES', 'grenades', ('hgr_', 'rgl_'), ('69',), 'grenades', 'grenades',
      'a grenade', 'detonation.explosionMaterial', [('detonation.explosionDamage', 1), ('damage', 0)], 1)
 ]
+STAMINA_PROPS = [('SprintRecoverTime', '0.1'), ('SprintDissipationTime', '100000'), ('SprintLossAtJump', '0')]
 PROP_WORDS = {'material': 'material', 'damage': 'damage', 'detonation.explosionMaterial': 'explosion material',
               'detonation.explosionDamage': 'explosionDamage'}
 TZ_WORDS = {'snipers': 'snipers', 'sniper': 'snipers', 'sni': 'snipers', 'snipe': 'snipers',
@@ -822,6 +830,10 @@ class FLDeathmatch(object):
         self.tz_guard = ''      # the template used as the guard (logged once)
         self.ac_checks = []     # (when, crate, its point's spot, label): where a made crate is after a while
         self.crate_sp = ''      # our ObjectSpawner template for the crates (made once a server run)
+        self.stam_on = 0        # endless stamina set
+        self.stam_old = {}      # soldier template (lower case) -> (its name, its own sprint values)
+        self.stam_seen = {}     # soldier templates seen at spawns
+        self.stam_missing = {}
         self.ac_found_logged = 0
         self.snipe_said = {}    # player index -> when told that sniper rifles are off
         self.ac_tpl = 0         # arena crates: the crate template changed / its own (refillAmmoSpeed, healSpeed)
@@ -1159,6 +1171,7 @@ class FLDeathmatch(object):
             if self.dmg_touched():
                 self.dmg_reset('shutdown')
             self.tz_reset('shutdown')
+            self.stamina_set(0, 'shutdown')
             while self.hs_q:
                 self.run_hs(0.0, 1000)
         except Exception:
@@ -1478,6 +1491,10 @@ class FLDeathmatch(object):
             # every deathmatch round sets its cells again, in case the game reset its damage table in between
             self.dmg_set(self.ci('HEADSHOTS') and 1 or 0, weap, 'new round: ' + (', '.join(whys) or 'all on'), 1)
         self.tz_round()
+        if self.ci('STAMINA'):
+            self.stamina_set(1, 'new round: STAMINA 1')
+        elif self.stam_on or self.stam_old:
+            self.stamina_set(0, 'new round: STAMINA 0')
         for nm in self.cs('INF_NAMES').split(','):
             nm = nm.strip()
             if nm and self.want_mags(nm) and nm not in self.mags_old and nm not in self.mags_q:
@@ -1868,7 +1885,9 @@ class FLDeathmatch(object):
                 if self.tz_guard != name:
                     self.tz_guard = name
                     self.log('guns: the guard template is %s %s' % (kind, name))
+                self.tz_guard_last = name
                 return 1
+        self.tz_guard_last = ''
         return 0
 
     def tz_proj_of(self, w):
@@ -1898,7 +1917,7 @@ class FLDeathmatch(object):
         pkey = pt.lower()
         if not self.tz_guard_on(g):
             self.log('%s: %s left alone - a %s template stays active after the guard (%s)'
-                     % (g[6], w, (g[9] == 'material' and 'bullet') or 'grenade', self.tz_guard or 'none found'))
+                     % (g[6], w, (g[9] == 'material' and 'bullet') or 'grenade', getattr(self, 'tz_guard_last', '') or 'none found'))
             return 0
         self.rcon('ObjectTemplate.activeSafe GenericProjectile %s' % pt)
         ident = self.rcon('ObjectTemplate.%s' % g[9])
@@ -2422,6 +2441,7 @@ class FLDeathmatch(object):
         if self.dmg_touched():
             self.dmg_reset(why)
         self.tz_reset(why)
+        self.stamina_set(0, why)
         self.crate_fast(0)
         self.crate_arena_tpl(0)
         self.mags_back()
@@ -2810,6 +2830,8 @@ class FLDeathmatch(object):
             extra.append('%s s spawn protection' % ('%.1f' % self.cf('SPAWN_GUARD')).replace('.0', ''))
         if self.ci('INF_MAGS'):
             extra.append('endless magazines')
+        if self.ci('STAMINA'):
+            extra.append('endless stamina')
         if self.ac_count() > 0:
             extra.append('%d ammo crates%s move round the arena every %d s'
                          % (self.ac_count(), (self.ci('ARENA_CRATE_HEAL') <= 0 and ' (no healing)') or '',
@@ -2866,6 +2888,8 @@ class FLDeathmatch(object):
             else:
                 self.spawn_look[i] = t + 0.6
             self.life_begin(p, soldier, t, not moved)
+            if self.stam_on:
+                self.stamina_seen(soldier)
             g = self.cf('SPAWN_GUARD')
             if g > 0:
                 self.guard[i] = t + g
@@ -4784,12 +4808,111 @@ class FLDeathmatch(object):
                 self.remove_crate(c, 'the round ended', 1)
         self.crates = [c for c in self.crates if c['state'] == 'parked']
 
+    # ------------------------------------------------------------------ endless stamina
+    # Soldier templates: SprintRecoverTime / SprintDissipationTime / SprintLossAtJump (mm_jumptest 0.1.0 tested it on
+    # Sagara's server 15.11: "the stamina worked"; stock light 17 / 10 / 0.15, heavy 20 / 8 / 0.2).
+    def stamina_names(self):
+        out = []
+        for nm in self.cs('STAMINA_SOLDIERS').split(','):
+            nm = nm.strip()
+            if nm and nm.lower() not in [x.lower() for x in out]:
+                out.append(nm)
+        for nm in self.stam_seen.keys():
+            if nm.lower() not in [x.lower() for x in out]:
+                out.append(nm)
+        return out
+
+    def stamina_one(self, name):
+        """Endless sprint for one soldier template: the guard made active first, so a name the server does not
+        have changes nothing (it must read a SprintDissipationTime over 0)."""
+        key = name.lower()
+        if key in self.stam_old:
+            return 1
+        self.tz_guard_on()
+        r = self.rcon('ObjectTemplate.activeSafe Soldier %s' % name)
+        olds = {}
+        for (prop, val) in STAMINA_PROPS:
+            olds[prop] = self.rcon('ObjectTemplate.%s' % prop)
+        if to_float(olds['SprintDissipationTime'], -1.0) <= 0:
+            if key not in self.stam_missing:
+                self.stam_missing[key] = 1
+                self.log('stamina: %s left alone - it reads SprintDissipationTime "%s" ("%s")'
+                         % (name, olds['SprintDissipationTime'], r))
+            return 0
+        done = []
+        for (prop, val) in STAMINA_PROPS:
+            if to_float(olds[prop], -1.0) >= 0:
+                self.rcon('ObjectTemplate.%s %s' % (prop, val))
+                done.append('%s %s -> %s' % (prop, olds[prop], val))
+            else:
+                olds[prop] = None
+        back = self.rcon('ObjectTemplate.SprintDissipationTime')
+        self.stam_old[key] = (name, olds)
+        self.log('stamina: %s %s (reads %s)' % (name, ', '.join(done), back))
+        return 1
+
+    def stamina_set(self, on, why):
+        on = on and 1 or 0
+        if on:
+            n = 0
+            for nm in self.stamina_names():
+                n = n + self.stamina_one(nm)
+            if not self.stam_on:
+                self.log('stamina: endless (%s), %d soldier templates' % (why, n))
+            self.stam_on = 1
+            return
+        if not self.stam_old and not self.stam_on:
+            return
+        keys = list(self.stam_old.keys())
+        keys.sort()
+        for key in keys:
+            (name, olds) = self.stam_old[key]
+            self.tz_guard_on()
+            self.rcon('ObjectTemplate.activeSafe Soldier %s' % name)
+            if to_float(self.rcon('ObjectTemplate.SprintDissipationTime'), -1.0) <= 0:
+                continue
+            for (prop, val) in STAMINA_PROPS:
+                if olds.get(prop) is not None:
+                    self.rcon('ObjectTemplate.%s %s' % (prop, olds[prop]))
+        self.log('stamina: back to the game\'s (%s), %d soldier templates' % (why, len(keys)))
+        self.stam_old = {}
+        self.stam_on = 0
+
+    def stamina_seen(self, soldier):
+        """A soldier template seen at a spawn while stamina is endless: done too (a kit's own template)."""
+        name = self.tpl(soldier)
+        if not name or name.lower() in self.stam_old or name in self.stam_seen:
+            return
+        self.stam_seen[name] = 1
+        if self.stam_on:
+            self.stamina_one(name)
+
+    def stamina_cmd(self, words, who):
+        if not words or words[0].lower() not in ('on', 'off'):
+            return 'fldm: stamina %s (STAMINA %d, %d soldier templates set)' % (
+                (self.stam_on and 'endless') or 'as in the game', self.ci('STAMINA'), len(self.stam_old))
+        on = (words[0].lower() == 'on') and 1 or 0
+        self.cfg['STAMINA'] = on
+        self.log('stamina %s by %s (STAMINA %d until the server restarts)' % ((on and 'endless') or 'normal', who, on))
+        if not self.active:
+            return 'fldm: stamina %s from when deathmatch is on (STAMINA %d until the server restarts)' % (
+                (on and 'endless') or 'normal', on)
+        self.stamina_set(on, who)
+        if on:
+            self.say('[DM] Endless stamina: sprint as long as you like.')
+        else:
+            self.say('[DM] Stamina is as in the game again.')
+        return 'fldm: stamina %s (%d soldier templates set)' % ((self.stam_on and 'endless') or 'as in the game',
+                                                                len(self.stam_old))
+
     # ------------------------------------------------------------------ ammo crates spread over the arena
     def crate_arena_tpl(self, on):
         """While arena crates are out: the crate template heals ARENA_CRATE_HEAL (0 = not at all) and refills
         ammo at ARENA_CRATE_AMMO ('' = its own speed); put back when they are taken in."""
         name = self.cs('CRATE')
         amm = self.cs('ARENA_CRATE_AMMO').strip()
+        if on and self.ci('ARENA_CRATE_HEAL') < 0:
+            return
         if on and not self.ac_tpl:
             self.rcon('ObjectTemplate.activeSafe SupplyObject %s' % name)
             r = self.rcon('ObjectTemplate.refillAmmoSpeed')
@@ -4966,13 +5089,16 @@ class FLDeathmatch(object):
         self.crate_sp = sp
         return sp
 
-    def crate_make(self, name, spot):
+    def crate_make(self, name, spot, way=None):
         """A crate at spot: (its object as the server lists it or None, id, the game's answers, the spawner's id).
         By the spawner way the game makes the crate a moment later: the object is looked for then (ac_find)."""
-        if self.cs('ARENA_CRATE_WAY').strip().lower() != 'direct':
+        if way is None:
+            way = self.cs('ARENA_CRATE_WAY').strip().lower()
+        if way != 'direct':
             sp = self.crate_spawner(name)
             a1 = self.rcon('Object.create %s' % sp)
             a2 = self.rcon('Object.absolutePosition %.2f/%.2f/%.2f' % (spot[0], spot[1], spot[2]))
+            self.rcon('Object.rotation 0/0/0')
             a3 = self.rcon('Object.layer 1')
             soid = ''
             w = a1.split()
@@ -4982,6 +5108,7 @@ class FLDeathmatch(object):
         n0 = len(self.crates_near(name, spot, 3.0))
         a1 = self.rcon('Object.create %s' % name)
         a2 = self.rcon('Object.absolutePosition %.2f/%.2f/%.2f' % (spot[0], spot[1], spot[2]))
+        self.rcon('Object.rotation 0/0/0')
         a3 = self.rcon('Object.layer 1')
         oid = ''
         w = a1.split()
@@ -5211,7 +5338,7 @@ class FLDeathmatch(object):
         self.log('crates where for %s at %s: %d m to %s, crate at %s' % (self.name_of(p), fmt_pos(pos), int(d + 0.5), nm.strip(),
                                                                        fmt_pos(q)))
 
-    def ac_here(self, p):
+    def ac_here(self, p, way=None):
         """!dm crates here (test): one crate 3 m in front of the player, for 2 minutes - is it seen?"""
         s = self.soldier_of(p)
         pos = self.pos_of(p)
@@ -5228,15 +5355,17 @@ class FLDeathmatch(object):
         high = (spot[0], spot[1] + up, spot[2])
         name = self.cs('CRATE')
         t = self.now()
-        (obj, oid, ans, soid) = self.crate_make(name, high)
+        if way not in ('direct', 'spawner'):
+            way = self.cs('ARENA_CRATE_WAY').strip().lower()
+        (obj, oid, ans, soid) = self.crate_make(name, high, way)
         c = {'t': t, 'until': t + 120.0, 'oid': oid, 'ai': None, 'spot': spot, 'name': name, 'obj': obj,
              'state': 'live', 'kind': 'test', 'sp_oid': soid}
-        if soid or (obj is None and self.cs('ARENA_CRATE_WAY').strip().lower() != 'direct'):
+        if soid or (obj is None and way != 'direct'):
             c['find'] = (t, high)
             c['spawner'] = 1
         self.crates.append(c)
-        self.log('crate here for %s at %s (made %.0f m over it, facing %.0f): create %s; the server lists it there: %s'
-                 % (self.name_of(p), fmt_pos(spot), up, yaw, ans, (obj is not None and 'yes') or 'NO'))
+        self.log('crate here (%s way) for %s at %s (made %.0f m over it, facing %.0f): create %s; the server lists it '
+                 'there: %s' % (way, self.name_of(p), fmt_pos(spot), up, yaw, ans, (obj is not None and 'yes') or 'NO'))
         self.ac_check_later(c, spot, 'crate here for %s' % self.name_of(p), t)
         how = (obj is not None and 'the server has it') or 'the server has it: NO'
         if c.get('find'):
@@ -5340,6 +5469,8 @@ class FLDeathmatch(object):
             return self.hp_cmd(words[1:], who)
         if sub in ('crates', 'crate', 'ammo'):
             return self.ac_cmd(words[1:], who)
+        if sub in ('stamina', 'sprint'):
+            return self.stamina_cmd(words[1:], who)
         if sub == 'info':
             lines = self.info_lines()
             if len(words) > 1 and words[1].lower() == 'say':
@@ -5407,6 +5538,8 @@ class FLDeathmatch(object):
                  % (self.ci('BAND_MIN'), self.ci('BAND_MAX'), self.ci('TP_ENEMY_MIN')))
         else:
             b = '[DM] Spawn: at your flags (the game\'s own spawn points, no drops).'
+        if self.stam_on or (self.ci('STAMINA') and not self.stam_old):
+            b = b + ' Endless stamina.'
         out = [a, b + ' A frag gives %s.' % self.hp_text()]
         if self.ac_count() > 0:
             out.append('[DM] Ammo crates: %d in the arena (ammo only%s), they move every %d s - !dm crates where.'
@@ -5631,7 +5764,10 @@ class FLDeathmatch(object):
             if sub2 == 'here' and self.ci('TEST_COMMANDS'):
                 if self.active and p is not None:
                     self.log('command from %s: %s' % (self.name_of(p), ' '.join(words)))
-                    self.ac_here(p)
+                    way = None
+                    if len(words) > 3:
+                        way = words[3].lower()
+                    self.ac_here(p, way)
                 return
         if cmd == 'info':
             if not self.ci('PUBLIC_SCORE') and not self.ci('TEST_COMMANDS'):
@@ -5660,7 +5796,7 @@ class FLDeathmatch(object):
                      'here [us|mec|any], where, points, tp <n>, limit <n>, end, drop, scan')
             return
         if cmd in ('on', 'off', 'status', 'hs', 'band', 'weapons', 'damage', 'hp', 'health', 'crates', 'crate',
-                   'ammo') or cmd in WEAPON_WORDS or \
+                   'ammo', 'stamina', 'sprint') or cmd in WEAPON_WORDS or \
                 cmd in TZ_WORDS:
             ans = self.switch(words[1:], 'chat by %s' % self.name_of(p))
             self.say('[DM] ' + ans.replace('fldm: ', ''))
