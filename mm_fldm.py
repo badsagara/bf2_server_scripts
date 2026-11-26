@@ -59,8 +59,8 @@ try:
 except Exception:
     _time = None
 
-__version__ = 1.42
-VERSION = '1.4.2'
+__version__ = 1.44
+VERSION = '1.4.4'
 
 __required_modules__ = {
     'modmanager': 1.0
@@ -215,9 +215,17 @@ configDefaults = {
     'STAMINA_SOLDIERS': 'us_light_soldier, us_heavy_soldier, mec_light_soldier, mec_heavy_soldier, '
                         'ch_light_soldier, ch_heavy_soldier',
                                     # soldier templates (and any seen at a spawn); a name the server lacks: left alone
-    'ARENA_CRATE_WAY': 'spawner',   # spawner: a crate is made by our own ObjectSpawner (the game makes it - the way
-                                    # the claytest crate was seen) | direct: Object.create supply_crate (1.3.7-1.3.9:
-                                    # the server had them, the players did not see them)
+    'ARENA_CRATE_WAY': 'spawner',   # spawner: a crate is made by our own ObjectSpawner (the game makes it and sends
+                                    # it to the players, as it does a map's vehicles) | direct: Object.create
+                                    # supply_crate - server only: the 25.11 demo has no CreateObject for such a crate,
+                                    # so no player ever gets it (a test switch, not for play)
+    'ARENA_SPAWNER_TEAM': 'alternate',  # spawner way: the team of each spawner object (Object.team). A spawner
+                                    # makes the template of its team (setObjectTemplate 1 / 2); with no team and no
+                                    # flag it makes nothing (1.4.0-1.4.2). alternate: slots 1, 3, 5 ... team 1, the
+                                    # others team 2 (both sides get crates even if a crate only serves its own
+                                    # side) | 1 | 2. A `here` crate takes the asking player's team.
+    'CRATE_SINK': 1,                # a spawner's crate that is taken away goes 1000 m under the map with its
+                                    # spawner (0: parked in the sky as before - the players see it come down)
     'ARENA_SPAWNER_DELAY': 0,       # spawner way: seconds before a spawner makes its next crate when its crate is
                                     # gone (used up, broken, timed out) - 0 as in the claytest, where crates came
                                     # 2 s after the spawner was placed (1.4.0's 99999 made none at all)
@@ -833,6 +841,7 @@ class FLDeathmatch(object):
         self.tz_guard = ''      # the template used as the guard (logged once)
         self.ac_checks = []     # (when, crate, its point's spot, label): where a made crate is after a while
         self.crate_sp = ''      # our ObjectSpawner template for the crates (made once a server run)
+        self.sp_team_said = 0
         self.stam_on = 0        # endless stamina set
         self.stam_old = {}      # soldier template (lower case) -> (its name, its own sprint values)
         self.stam_seen = {}     # soldier templates seen at spawns
@@ -1298,7 +1307,7 @@ class FLDeathmatch(object):
                        'not_counted': 0, 'flag_holds': 0, 'tp_up_blocked': 0, 'tp_across_short': 0,
                        'tp_near': 0, 'tp_hurt': 0, 'guard_hp': 0, 'guard_deaths': 0, 'refill': 0,
                        'refill_more': 0, 'refill_unseen': 0, 'refill_reused': 0, 'refill_deleted': 0,
-                       'refill_parked': 0, 'refill_lifted': 0, 'spawns': 0, 'spawn_enemy_20m': 0,
+                       'refill_parked': 0, 'refill_lifted': 0, 'crate_sunk': 0, 'spawns': 0, 'spawn_enemy_20m': 0,
                        'spawn_enemy_10m': 0, 'spawn_outside': 0}
         self.score_checked = 0
         self.tts_checked = 0
@@ -4740,6 +4749,22 @@ class FLDeathmatch(object):
         if c['obj'] is None and c.get('spawner'):
             c['state'] = 'gone'     # its crate was never found: nothing of ours to take away
             return
+        if c.get('spawner') and c['obj'] is not None and self.ci('CRATE_SINK'):
+            # The game sends a spawner's crate to the players, so a crate parked in the sky is seen coming down on
+            # its parachute (and lifted again). Under the map nobody sees it; the game takes it away within 5 min.
+            try:
+                q = c['obj'].getPosition()
+                c['obj'].setPosition((float(q[0]), -1000.0, float(q[2])))
+                c['state'] = 'gone'
+                self.counts['crate_sunk'] = self.counts['crate_sunk'] + 1
+                if self.removals_logged < self.ci('REFILL_LOG') and not quiet:
+                    self.removals_logged = self.removals_logged + 1
+                    self.log('crate at %s taken away (%s): put 1000 m under the map with its spawner'
+                             % (fmt_pos(c['spot']), why))
+                return
+            except Exception:
+                self.log('crate at %s: cannot put it under the map (%s) - parked in the sky instead'
+                         % (fmt_pos(c['spot']), err_text()))
         name = c['name']
         spot = c['spot']
         ans = 'no id'
@@ -5099,22 +5124,37 @@ class FLDeathmatch(object):
         self.crate_sp = sp
         return sp
 
-    def crate_make(self, name, spot, way=None):
+    def ac_team(self, slot):
+        """The team of a slot's spawner object (ARENA_SPAWNER_TEAM): 1 or 2."""
+        v = self.cs('ARENA_SPAWNER_TEAM').strip().lower()
+        if v in ('1', '2'):
+            return int(v)
+        return (slot % 2) + 1
+
+    def crate_make(self, name, spot, way=None, team=1):
         """A crate at spot: (its object as the server lists it or None, id, the game's answers, the spawner's id).
-        By the spawner way the game makes the crate a moment later: the object is looked for then (ac_find)."""
+        By the spawner way the game makes the crate a moment later: the object is looked for then (ac_find).
+        A spawner makes the template of its own team, so its object gets Object.team (1 or 2)."""
         if way is None:
             way = self.cs('ARENA_CRATE_WAY').strip().lower()
         if way != 'direct':
             sp = self.crate_spawner(name)
+            if team not in (1, 2):
+                team = 1
             a1 = self.rcon('Object.create %s' % sp)
             a2 = self.rcon('Object.absolutePosition %.2f/%.2f/%.2f' % (spot[0], spot[1], spot[2]))
             self.rcon('Object.rotation 0/0/0')
             a3 = self.rcon('Object.layer 1')
+            a4 = self.rcon('Object.team %d' % team)
             soid = ''
             w = a1.split()
             if w and w[0].lower().startswith('id'):
                 soid = w[0]
-            return (None, '', 'spawner "%s", position "%s", layer "%s"' % (a1, a2, a3), soid)
+            if a4 and not self.sp_team_said:
+                self.sp_team_said = 1
+                self.log('WARNING: Object.team %d on the crate spawner answered "%s" - without a team a spawner '
+                         'makes nothing' % (team, a4))
+            return (None, '', 'spawner "%s", position "%s", layer "%s", team %d "%s"' % (a1, a2, a3, team, a4), soid)
         n0 = len(self.crates_near(name, spot, 3.0))
         a1 = self.rcon('Object.create %s' % name)
         a2 = self.rcon('Object.absolutePosition %.2f/%.2f/%.2f' % (spot[0], spot[1], spot[2]))
@@ -5218,8 +5258,8 @@ class FLDeathmatch(object):
                 self.ac_stat['unseen'] = self.ac_stat.get('unseen', 0) + 1
                 if self.ac_found_logged < 6:
                     self.ac_found_logged = self.ac_found_logged + 1
-                    self.log('NO crate from the spawner at %s in 8 s (the game made none, or it is not where it '
-                             'should be) - still looked for' % fmt_pos(high))
+                    self.log('NO crate from the spawner at %s in 8 s (team %s; the game made none, or it is not '
+                             'where it should be) - still looked for' % (fmt_pos(high), c.get('team', '?')))
 
     def run_ac_checks(self, t):
         keep = []
@@ -5309,7 +5349,8 @@ class FLDeathmatch(object):
         if c is not None:
             self.remove_crate(c, 'a spawner crate instead', 1)
         self.crates = [x for x in self.crates if x['state'] != 'gone']
-        (obj, oid, ans, soid) = self.crate_make(name, high, 'spawner')
+        team = self.ac_team(slot)
+        (obj, oid, ans, soid) = self.crate_make(name, high, 'spawner', team)
         taken = []
         for x in self.crates:
             if x.get('sp_obj') is not None:
@@ -5317,7 +5358,7 @@ class FLDeathmatch(object):
         spo = self.spawner_obj_at(self.crate_sp, high, taken)
         c = {'t': t, 'until': 1e18, 'oid': '', 'ai': None, 'spot': spot, 'high': high, 'name': name, 'obj': None,
              'state': 'live', 'kind': 'arena', 'slot': slot, 'k': k, 'sp_oid': soid, 'sp_obj': spo, 'spawner': 1,
-             'find': (t, high)}
+             'find': (t, high), 'team': team}
         self.crates.append(c)
         st['made'] = st['made'] + 1
         if self.ac_logged < 2:
@@ -5474,16 +5515,22 @@ class FLDeathmatch(object):
         t = self.now()
         if way not in ('direct', 'spawner'):
             way = self.cs('ARENA_CRATE_WAY').strip().lower()
-        (obj, oid, ans, soid) = self.crate_make(name, high, way)
+        team = self.team_of(p)
+        if team not in (1, 2):
+            team = 1
+        (obj, oid, ans, soid) = self.crate_make(name, high, way, team)
         c = {'t': t, 'until': t + 120.0, 'oid': oid, 'ai': None, 'spot': spot, 'high': high, 'name': name, 'obj': obj,
-             'state': 'live', 'kind': 'test', 'sp_oid': soid}
+             'state': 'live', 'kind': 'test', 'sp_oid': soid, 'team': team}
         if soid or (obj is None and way != 'direct'):
             c['find'] = (t, high)
             c['spawner'] = 1
             c['sp_obj'] = self.spawner_obj_at(self.crate_sp, high, [])
         self.crates.append(c)
-        self.log('crate here (%s way) for %s at %s (made %.0f m over it, facing %.0f): create %s; the server lists it '
-                 'there: %s' % (way, self.name_of(p), fmt_pos(spot), up, yaw, ans, (obj is not None and 'yes') or 'NO'))
+        there = (obj is not None and 'the server lists it there: yes') or 'the server lists it there: NO'
+        if c.get('find'):
+            there = 'the spawner makes it a moment later'
+        self.log('crate here (%s way) for %s at %s (made %.0f m over it, facing %.0f): create %s; %s'
+                 % (way, self.name_of(p), fmt_pos(spot), up, yaw, ans, there))
         self.ac_check_later(c, spot, 'crate here for %s' % self.name_of(p), t)
         how = (obj is not None and 'the server has it') or 'the server has it: NO'
         if c.get('find'):
